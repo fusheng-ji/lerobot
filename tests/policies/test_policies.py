@@ -51,6 +51,7 @@ from lerobot.utils.import_utils import is_package_available
 from lerobot.utils.random_utils import seeded_context
 from lerobot.utils.utils import cycle
 from tests.artifacts.policies.save_policy_to_safetensors import get_policy_stats
+from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.utils import DEVICE, require_cpu, require_env, require_x86_64_kernel
 
 # Policies that require optional heavy dependencies to instantiate
@@ -62,6 +63,26 @@ _ALL_POLICIES = ["act", "diffusion", "tdmpc", "vqbet"]
 AVAILABLE_POLICIES = [
     p for p in _ALL_POLICIES if all(is_package_available(pkg) for pkg in _POLICY_REQUIRED_PACKAGES.get(p, ()))
 ]
+
+# Feature layout of the datasets each env is trained on. A synthetic local dataset with the same layout stands
+# in for the Hub download, so the tests below need no network access.
+_ENV_DATASET_LAYOUT = {
+    "pusht": {"fps": 10, "motor_dim": 2, "camera_key": "observation.image", "image_shape": (96, 96, 3)},
+    "aloha": {
+        "fps": 50,
+        "motor_dim": 14,
+        "camera_key": "observation.images.top",
+        "image_shape": (480, 640, 3),
+    },
+}
+
+
+def make_offline_policy_config(policy_name: str, **kwargs):
+    """Like `make_policy_config`, but without the ImageNet weights ResNet backbones download by default."""
+    cfg = make_policy_config(policy_name, **kwargs)
+    if hasattr(cfg, "pretrained_backbone_weights"):
+        cfg.pretrained_backbone_weights = None
+    return cfg
 
 
 @pytest.fixture
@@ -110,44 +131,20 @@ def test_get_policy_and_config_classes(policy_name: str):
 
 
 @pytest.mark.parametrize(
-    "ds_repo_id,env_name,env_kwargs,policy_name,policy_kwargs",
+    "env_name,env_kwargs,policy_name,policy_kwargs",
     [
-        ("lerobot/pusht", "pusht", {}, "diffusion", {}),
-        ("lerobot/pusht", "pusht", {}, "vqbet", {}),
-        ("lerobot/pusht", "pusht", {}, "act", {}),
-        ("lerobot/aloha_sim_insertion_human", "aloha", {"task": "AlohaInsertion-v0"}, "act", {}),
-        (
-            "lerobot/aloha_sim_insertion_scripted",
-            "aloha",
-            {"task": "AlohaInsertion-v0"},
-            "act",
-            {},
-        ),
-        (
-            "lerobot/aloha_sim_insertion_human",
-            "aloha",
-            {"task": "AlohaInsertion-v0"},
-            "diffusion",
-            {},
-        ),
-        (
-            "lerobot/aloha_sim_transfer_cube_human",
-            "aloha",
-            {"task": "AlohaTransferCube-v0"},
-            "act",
-            {},
-        ),
-        (
-            "lerobot/aloha_sim_transfer_cube_scripted",
-            "aloha",
-            {"task": "AlohaTransferCube-v0"},
-            "act",
-            {},
-        ),
+        ("pusht", {}, "diffusion", {}),
+        ("pusht", {}, "vqbet", {}),
+        ("pusht", {}, "act", {}),
+        ("aloha", {"task": "AlohaInsertion-v0"}, "act", {}),
+        ("aloha", {"task": "AlohaInsertion-v0"}, "diffusion", {}),
+        ("aloha", {"task": "AlohaTransferCube-v0"}, "act", {}),
     ],
 )
 @require_env
-def test_policy(ds_repo_id, env_name, env_kwargs, policy_name, policy_kwargs):
+def test_policy(
+    tmp_path, info_factory, lerobot_dataset_factory, env_name, env_kwargs, policy_name, policy_kwargs
+):
     """
     Tests:
         - Making the policy object.
@@ -162,13 +159,35 @@ def test_policy(ds_repo_id, env_name, env_kwargs, policy_name, policy_kwargs):
     """
     if policy_name == "vqbet" and DEVICE == "mps":
         pytest.skip("VQBet does not support MPS backend")
-    if policy_name == "act" and "aloha" in ds_repo_id and DEVICE == "mps":
+    if policy_name == "act" and env_name == "aloha" and DEVICE == "mps":
         pytest.skip("ACT with aloha has batch mutation issues on MPS")
 
+    layout = _ENV_DATASET_LAYOUT[env_name]
+    motor_names = [f"motor_{i}" for i in range(layout["motor_dim"])]
+    info = info_factory(
+        fps=layout["fps"],
+        total_episodes=1,
+        total_frames=60,
+        total_tasks=1,
+        motor_features={
+            ACTION: {"dtype": "float32", "shape": (layout["motor_dim"],), "names": motor_names},
+            OBS_STATE: {"dtype": "float32", "shape": (layout["motor_dim"],), "names": motor_names},
+        },
+        camera_features={
+            layout["camera_key"]: {
+                "shape": layout["image_shape"],
+                "names": ["height", "width", "channels"],
+                "info": None,
+            }
+        },
+        use_videos=False,
+    )
+    root = tmp_path / "dataset"
+    lerobot_dataset_factory(root=root, info=info, use_videos=False)
+
     train_cfg = TrainPipelineConfig(
-        # TODO(rcadene, aliberts): remove dataset download
-        dataset=DatasetConfig(repo_id=ds_repo_id, episodes=[0]),
-        policy=make_policy_config(policy_name, push_to_hub=False, **policy_kwargs),
+        dataset=DatasetConfig(repo_id=DUMMY_REPO_ID, root=str(root), episodes=[0]),
+        policy=make_offline_policy_config(policy_name, push_to_hub=False, **policy_kwargs),
         env=make_env_config(env_name, **env_kwargs),
     )
     train_cfg.policy.device = DEVICE
@@ -244,15 +263,16 @@ def test_policy(ds_repo_id, env_name, env_kwargs, policy_name, policy_kwargs):
 
 
 # TODO(rcadene, aliberts): This test is quite end-to-end. Move this test in test_optimizer?
-def test_act_backbone_lr():
+def test_act_backbone_lr(dummy_dataset_metadata):
     """
     Test that the ACT policy can be instantiated with a different learning rate for the backbone.
     """
 
     cfg = TrainPipelineConfig(
-        # TODO(rcadene, aliberts): remove dataset download
-        dataset=DatasetConfig(repo_id="lerobot/aloha_sim_insertion_scripted", episodes=[0]),
-        policy=make_policy_config("act", optimizer_lr=0.01, optimizer_lr_backbone=0.001, push_to_hub=False),
+        dataset=DatasetConfig(repo_id=DUMMY_REPO_ID),
+        policy=make_offline_policy_config(
+            "act", optimizer_lr=0.01, optimizer_lr_backbone=0.001, push_to_hub=False
+        ),
     )
     cfg.policy.device = DEVICE
     cfg.validate()  # Needed for auto-setting some parameters
@@ -260,9 +280,8 @@ def test_act_backbone_lr():
     assert cfg.policy.optimizer_lr == 0.01
     assert cfg.policy.optimizer_lr_backbone == 0.001
 
-    dataset = make_dataset(cfg)
     preprocessor, _ = make_pre_post_processors(cfg.policy, None)
-    policy = make_policy(cfg.policy, ds_meta=dataset.meta)
+    policy = make_policy(cfg.policy, ds_meta=dummy_dataset_metadata)
     optimizer, _ = make_optimizer_and_scheduler(cfg, policy)
     assert len(optimizer.param_groups) == 2
     assert optimizer.param_groups[0]["lr"] == cfg.policy.optimizer_lr
@@ -282,7 +301,7 @@ def test_optimizer_preset_forwards_fused(policy_name: str, fused: bool | None):
 def test_policy_defaults(dummy_dataset_metadata, policy_name: str):
     """Check that the policy can be instantiated with defaults."""
     policy_cls = get_policy_class(policy_name)
-    policy_cfg = make_policy_config(policy_name)
+    policy_cfg = make_offline_policy_config(policy_name)
     features = dataset_to_policy_features(dummy_dataset_metadata.features)
     policy_cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     policy_cfg.input_features = {
@@ -294,7 +313,7 @@ def test_policy_defaults(dummy_dataset_metadata, policy_name: str):
 @pytest.mark.parametrize("policy_name", AVAILABLE_POLICIES)
 def test_save_and_load_pretrained(dummy_dataset_metadata, tmp_path, policy_name: str):
     policy_cls = get_policy_class(policy_name)
-    policy_cfg = make_policy_config(policy_name)
+    policy_cfg = make_offline_policy_config(policy_name)
     features = dataset_to_policy_features(dummy_dataset_metadata.features)
     policy_cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     policy_cfg.input_features = {
@@ -315,7 +334,7 @@ def test_save_pretrained_single_file_artifact(dummy_dataset_metadata, tmp_path):
     kwarg would now be silently swallowed by HubMixin's **push_to_hub_kwargs.
     """
     policy_cls = get_policy_class("act")
-    policy_cfg = make_policy_config("act")
+    policy_cfg = make_offline_policy_config("act")
     features = dataset_to_policy_features(dummy_dataset_metadata.features)
     policy_cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     policy_cfg.input_features = {
