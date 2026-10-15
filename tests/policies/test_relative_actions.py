@@ -3,7 +3,7 @@
 Tests the complete flow matching OpenPI:
   raw actions → RelativeActions → Normalize(relative_stats) → model → Unnormalize → AbsoluteActions
 
-Uses real dataset: lerobot-data-collection/dagger_final_1_21
+Runs on synthetic smooth trajectories, so it needs no Hub access.
 """
 
 from types import SimpleNamespace
@@ -16,7 +16,6 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.datasets.compute_stats import get_feature_stats
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.processor import (
     DataProcessorPipeline,
     TransitionKey,
@@ -34,12 +33,44 @@ from lerobot.processor.relative_action_processor import (
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 CHUNK_SIZE = 10
-REPO_ID = "lerobot-data-collection/dagger_final_1_21"
+ACTION_DIM = 6
+# Frames by which the commanded action leads the measured state, as with a teleoperated leader arm.
+ACTION_LEAD = 3
+
+
+def _synthetic_episodes(lengths=(120, 120), seed=0):
+    """Frames of smooth random-walk trajectories, with the action leading the state.
+
+    Chunk-level relative actions only behave like they do on robot data when consecutive frames are
+    correlated, so independent noise per frame would not do.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    frames = []
+    for episode_index, length in enumerate(lengths):
+        velocity = torch.zeros(ACTION_DIM)
+        position = torch.zeros(ACTION_DIM)
+        positions = []
+        for _ in range(length + ACTION_LEAD):
+            velocity = 0.9 * velocity + 0.05 * torch.randn(ACTION_DIM, generator=gen)
+            position = position + velocity
+            positions.append(position)
+        positions = torch.stack(positions)
+        states = positions[:length] + 0.005 * torch.randn(length, ACTION_DIM, generator=gen)
+        actions = positions[ACTION_LEAD:]
+        frames += [
+            {ACTION: action, OBS_STATE: state, "episode_index": torch.tensor(episode_index)}
+            for action, state in zip(actions, states, strict=True)
+        ]
+    return frames
 
 
 @pytest.fixture(scope="module")
 def dataset():
-    return LeRobotDataset(REPO_ID, episodes=[0])
+    """In-memory stand-in for a `LeRobotDataset`, exposing only what these tests read."""
+    return SimpleNamespace(
+        hf_dataset=_synthetic_episodes(),
+        meta=SimpleNamespace(features={ACTION: {"shape": (ACTION_DIM,)}}),
+    )
 
 
 @pytest.fixture(scope="module")
