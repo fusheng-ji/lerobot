@@ -215,3 +215,22 @@ class TestApplyTorchCompile:
         call = source.index("apply_torch_compile(")
         guard = source.rindex("if not cfg.parallelism.is_sharded:", 0, call)
         assert source[guard:call].count("\n") == 1, "the guard must be the line before the call"
+
+
+class TestCompiledStateDict:
+    def test_compiled_region_keeps_eager_checkpoint_keys(self):
+        eager, compiled = _RegionPolicy(), _RegionPolicy()
+        compiled.load_state_dict(eager.state_dict())
+        compiled = apply_torch_compile(compiled, CompileConfig())
+
+        assert set(compiled.state_dict()) == set(eager.state_dict())
+
+    def test_state_dict_round_trips_between_eager_and_compiled(self):
+        source, target = _RegionPolicy(), _RegionPolicy()
+        compiled = apply_torch_compile(_RegionPolicy(), CompileConfig())
+
+        compiled.load_state_dict(source.state_dict())  # eager checkpoint into a compiled policy
+        target.load_state_dict(compiled.state_dict())  # compiled checkpoint into an eager policy
+
+        for key, value in source.state_dict().items():
+            assert torch.equal(value, target.state_dict()[key])

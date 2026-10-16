@@ -147,7 +147,32 @@ def apply_torch_compile(policy: nn.Module, compile_cfg: CompileConfig) -> nn.Mod
     if regions:
         for name in regions:
             setattr(policy, name, torch.compile(getattr(policy, name), **kwargs))
+        _hide_compile_wrapper_from_state_dict(policy, regions)
         logging.info("torch.compile applied to %s (%s)", ", ".join(regions), kwargs)
         return policy
     logging.info("torch.compile applied to the whole policy (%s)", kwargs)
     return torch.compile(policy, **kwargs)
+
+
+def _hide_compile_wrapper_from_state_dict(policy: nn.Module, regions: tuple[str, ...]) -> None:
+    """Keep checkpoints free of the `_orig_mod` segment that `torch.compile` adds to parameter names.
+
+    A compiled region is an `OptimizedModule`, so `state_dict()` would name its parameters
+    `model._orig_mod.<name>`; a checkpoint saved like that matches no eager policy. The saved keys
+    stay `model.<name>` and, on load, either form is accepted.
+    """
+
+    def strip(_module, state_dict, prefix, _local_metadata):
+        for region in regions:
+            wrapped = f"{prefix}{region}._orig_mod."
+            for key in [k for k in state_dict if k.startswith(wrapped)]:
+                state_dict[f"{prefix}{region}.{key[len(wrapped) :]}"] = state_dict.pop(key)
+
+    def restore(_module, state_dict, prefix, *_args):
+        for region in regions:
+            plain, wrapped = f"{prefix}{region}.", f"{prefix}{region}._orig_mod."
+            for key in [k for k in state_dict if k.startswith(plain) and not k.startswith(wrapped)]:
+                state_dict[f"{wrapped}{key[len(plain) :]}"] = state_dict.pop(key)
+
+    policy._register_state_dict_hook(strip)
+    policy._register_load_state_dict_pre_hook(restore, with_module=True)
